@@ -1,4 +1,5 @@
 import customtkinter as ctk
+import tkinter as tk
 import threading
 import keyboard
 import sounddevice as sd
@@ -277,6 +278,9 @@ class VoicetexApp(ctk.CTk):
         self.selected_device_id = None  # None = rendszer alapértelmezett
         self._auto_stop_timer = None    # 5 másodperces auto-stop timer
         self.target_hwnd = None         # Célablak handle (ahová beillesztünk)
+        self._vu_level   = 0.0          # Aktuális hangszint 0.0–1.0
+        self._vu_peak    = 0.0          # Csúcsjelző (lassan csökken)
+        self._monitor_stream = None     # Folyamatos figyelő stream (nem felvétel)
 
         # --- UI Felépítése ---
         self.label = ctk.CTkLabel(self, text="Voicetex AI", font=("Segoe UI", 24, "bold"))
@@ -429,7 +433,137 @@ class VoicetexApp(ctk.CTk):
         self.help_label = ctk.CTkLabel(self, text=info_text, font=("Segoe UI", 10), text_color="gray")
         self.help_label.pack(pady=(12, 5))
 
+        # --- VU Meter ---
+        ctk.CTkLabel(self, text="Hangszint  –  kattints és tartsd nyomva a felvételhez:",
+                     font=("Segoe UI", 10), text_color="gray").pack(pady=(8, 2))
+
+        self._vu_canvas = tk.Canvas(
+            self,
+            width=400, height=38,
+            bg="#1a1a2e",
+            highlightthickness=1,
+            highlightbackground="#333355",
+            cursor="hand2"
+        )
+        self._vu_canvas.pack(pady=(0, 10))
+
+        # Egér: nyomva tartás = felvétel, elengedés = feldolgozás
+        self._vu_canvas.bind("<ButtonPress-1>",   self._on_vu_press)
+        self._vu_canvas.bind("<ButtonRelease-1>", self._on_vu_release)
+
+        # VU animáció indítása
+        self._draw_vu_meter()
+
         threading.Thread(target=self.setup_hotkeys, daemon=True).start()
+        threading.Thread(target=self._start_monitor_stream, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
+    #  VU METER                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _draw_vu_meter(self):
+        """VU meter kirajzolása és folyamatos frissítése (50ms-enként)."""
+        c = self._vu_canvas
+        c.delete("all")
+
+        W, H = 400, 38
+        N = 28          # sávok száma
+        gap = 3
+        bar_w = (W - (N + 1) * gap) / N
+        level = self._vu_level          # 0.0–1.0
+        peak  = self._vu_peak           # csúcs
+
+        for i in range(N):
+            x1 = gap + i * (bar_w + gap)
+            x2 = x1 + bar_w
+            frac = (i + 1) / N          # hány sáv van bekapcsolva ennél a szintnél
+
+            # Szín logika: zöld → sárga → piros
+            if frac <= 0.55:
+                on_color  = "#00e676"   # zöld
+                off_color = "#0a3320"
+            elif frac <= 0.80:
+                on_color  = "#ffea00"   # sárga
+                off_color = "#2e2a00"
+            else:
+                on_color  = "#ff1744"   # piros
+                off_color = "#2e0007"
+
+            lit = frac <= level
+            color = on_color if lit else off_color
+
+            # Csúcsjelző: a csúcs sávot mindig kiemeljük
+            if abs(frac - peak) < 1 / N:
+                color = on_color
+
+            y1, y2 = 5, H - 5
+            c.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
+
+        # Felvétel közben: villogó szegély
+        if self.recording:
+            c.configure(highlightbackground="#ff1744", highlightthickness=2)
+        else:
+            c.configure(highlightbackground="#333355", highlightthickness=1)
+
+        # Csúcs lassú csökkenése
+        self._vu_peak = max(0.0, self._vu_peak - 0.015)
+        # Szint gyors csillapítása (ha nincs új adat)
+        self._vu_level = max(0.0, self._vu_level * 0.75)
+
+        # Következő frame 50ms múlva
+        self.after(50, self._draw_vu_meter)
+
+    def _on_vu_press(self, event):
+        """Egérgomb lenyomása a VU meteren → felvétel indítása."""
+        self.target_hwnd = get_foreground_window()
+        self.start_recording()
+
+    def _on_vu_release(self, event):
+        """Egérgomb elengedése → felvétel leállítása."""
+        if self.recording:
+            self._cancel_auto_stop()
+            self.recording = False
+            self.process_audio()
+
+    def _start_monitor_stream(self):
+        """
+        Folyamatos, csendes figyelő stream – mindig fut (felvételen kívül is),
+        csak a hangszintet frissíti, nem menti az adatot.
+        Eszközváltáskor újraindul.
+        """
+        while True:
+            try:
+                with sd.InputStream(
+                    samplerate=self.fs,
+                    channels=1,
+                    device=self.selected_device_id,
+                    callback=self._monitor_callback,
+                    blocksize=1024
+                ):
+                    # Addig fut amíg az eszköz meg nem változik
+                    prev_dev = self.selected_device_id
+                    while self.selected_device_id == prev_dev:
+                        sd.sleep(200)
+            except Exception:
+                time.sleep(1)   # Hiba esetén 1mp múlva újrapróbálja
+
+    def _monitor_callback(self, indata, frames, t, status):
+        """
+        Folyamatos figyelő callback – mindig frissíti a VU szintet.
+        Ha éppen felvétel is folyik, az adatot is elmenti.
+        """
+        # RMS számítás → normalizálás 0–1 tartományba
+        rms = float(np.sqrt(np.mean(indata ** 2)))
+        # Logaritmikus skála: érzékenyebb a kis hangokra
+        level = min(1.0, rms * 12.0)
+
+        self._vu_level = max(self._vu_level * 0.4, level)   # gyors attack
+        if level > self._vu_peak:
+            self._vu_peak = level
+
+        # Felvétel esetén az adat is kerüljön a pufferbe
+        if self.recording:
+            self.audio_data.append(indata.copy())
 
     def on_device_change(self, selected):
         """Frissíti a kiválasztott eszköz ID-ját és infó feliratát."""
@@ -599,38 +733,18 @@ class VoicetexApp(ctk.CTk):
 
     def start_recording(self):
         if not self.recording and self.whisper_model:
-            # Elmentjük a célablakot MIELŐTT bármi fókuszt váltana
-            self.target_hwnd = get_foreground_window()
+            # Célablak mentése MIELŐTT bármi fókuszt váltana
+            if not self.target_hwnd:
+                self.target_hwnd = get_foreground_window()
             self.recording = True
             self.audio_data = []
-            self.status_label.configure(text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / Alt+Space tartva: folytatja)", text_color="red")
-
+            self.status_label.configure(
+                text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / tartva: folytatja)",
+                text_color="red"
+            )
             # 5 másodperces auto-stop indítása
             self._schedule_auto_stop()
-
-            def record():
-                try:
-                    with sd.InputStream(
-                        samplerate=self.fs,
-                        channels=1,
-                        device=self.selected_device_id,
-                        callback=self.callback
-                    ):
-                        while self.recording:
-                            sd.sleep(100)
-                except Exception as e:
-                    self._cancel_auto_stop()
-                    self.recording = False
-                    self.status_label.configure(
-                        text=f"Mikrofon hiba: {str(e)[:60]}",
-                        text_color="red"
-                    )
-
-            threading.Thread(target=record).start()
-
-    def callback(self, indata, frames, time, status):
-        if self.recording:
-            self.audio_data.append(indata.copy())
+            # Az adat gyűjtését a _monitor_callback végzi (mindig fut)
 
     def stop_recording_if_active(self, event):
         """Megtartjuk kompatibilitás miatt, de most már a _on_key_release kezeli."""
@@ -709,6 +823,7 @@ class VoicetexApp(ctk.CTk):
                     pass
 
             paste_text_to_window(self.target_hwnd, text)
+            self.target_hwnd = None     # reset, következő felvételnél újra olvassuk
 
             self.status_label.configure(text="Állapot: ✅ Beillesztve!", text_color="green")
 
