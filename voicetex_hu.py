@@ -127,6 +127,23 @@ def apply_voice_commands(text: str) -> str:
     # a sortöréseket (pl. "bekezdés" a szöveg elején/végén) megőrizzük!
     return text.strip(' \t')
 
+# --- GPU / CPU DETEKTÁLÁS ---
+def detect_device():
+    """
+    Megvizsgálja, hogy elérhető-e CUDA GPU.
+    Visszatérési érték: ("cuda", "float16") vagy ("cpu", "int8")
+    """
+    try:
+        import ctranslate2
+        generators = ctranslate2.get_supported_compute_types("cuda")
+        if generators:
+            return "cuda", "float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
+DEVICE, DEFAULT_COMPUTE = detect_device()
+
 # --- HELYI MODELL KÖNYVTÁR (konvertált HF modellek ide kerülnek) ---
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voicetex_models")
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -266,7 +283,16 @@ class VoicetexApp(ctk.CTk):
         self.label.pack(pady=(20, 5))
 
         self.subtitle = ctk.CTkLabel(self, text="Magyar Offline Diktáló", font=("Segoe UI", 12), text_color="gray")
-        self.subtitle.pack(pady=(0, 15))
+        self.subtitle.pack(pady=(0, 5))
+
+        # GPU / CPU mód jelzése
+        if DEVICE == "cuda":
+            hw_text = "⚡ GPU mód (CUDA) – gyors feldolgozás"
+            hw_color = "#5BC8F5"
+        else:
+            hw_text = "⚠ CPU mód – NVIDIA GPU nem található, lassabb lesz (~10-30 mp/mondat)"
+            hw_color = "orange"
+        ctk.CTkLabel(self, text=hw_text, font=("Segoe UI", 10), text_color=hw_color).pack(pady=(0, 10))
 
         # --- Mikrofon eszközválasztó ---
         self.device_label = ctk.CTkLabel(self, text="Mikrofon / Hangbemeneti eszköz:")
@@ -474,8 +500,12 @@ class VoicetexApp(ctk.CTk):
                         )
 
                 # Betöltés faster-whisper-rel
-                # hu_hf_f32: float32 kötelező (float16 kvantálás mondatcsonkítást okoz ennél a modellnél)
-                if mtype == "hu_hf_f32":
+                # GPU módban: float16 (vagy int8_float16 fallback)
+                # CPU módban: int8 (gyorsabb és kisebb memóriaigény CPU-n)
+                # hu_hf_f32: float32 kötelező GPU-n (float16 kvantálás mondatcsonkítást okoz)
+                if DEVICE == "cpu":
+                    self.whisper_model = WhisperModel(load_path, device="cpu", compute_type="int8")
+                elif mtype == "hu_hf_f32":
                     self.whisper_model = WhisperModel(load_path, device="cuda", compute_type="float32")
                 else:
                     try:
@@ -494,7 +524,7 @@ class VoicetexApp(ctk.CTk):
                     extractor_mels = self.whisper_model.feature_extractor.mel_filters.shape[0]
                     if model_mels != extractor_mels:
                         self.whisper_model.feature_extractor = FE(
-                            device="cuda",
+                            device=DEVICE,
                             num_mel_bins=model_mels
                         )
                 except Exception:
