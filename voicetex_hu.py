@@ -9,6 +9,9 @@ from faster_whisper import WhisperModel
 import ollama
 import pyautogui
 import pyperclip
+import pystray
+from PIL import Image, ImageDraw
+from datetime import datetime
 import os
 import re
 import subprocess
@@ -61,6 +64,62 @@ def paste_text_to_window(hwnd, text):
         if i < len(lines) - 1:  # Ha nem az utolsó sor: Enter
             pyautogui.press('enter')
             time.sleep(0.08)
+
+# --- TÁLCA IKON RAJZOLÁS ---
+def _make_tray_image(color: str = "#4a9eff") -> Image.Image:
+    """
+    64×64 px tálca ikont készít: sötét háttér + színes kör.
+    Szín: kék=készen áll, piros=felvétel, szürke=nincs modell.
+    """
+    def hex_to_rgb(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    img  = Image.new("RGB", (64, 64), (28, 28, 46))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([6, 6, 58, 58], fill=hex_to_rgb(color))
+    # Kis mikrofon szimbólum: fehér téglalap + félkör
+    draw.rectangle([26, 18, 38, 38], fill=(255, 255, 255))
+    draw.ellipse([22, 28, 42, 46], fill=(255, 255, 255))
+    draw.rectangle([26, 44, 38, 52], fill=(255, 255, 255))
+    return img
+
+
+# --- NAPLÓZÁS ---
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "napló")
+
+def save_to_log(text: str, start_dt: datetime):
+    """
+    Elmenti a felismert szöveget napi naplófájlba.
+    Fájlnév: whisper_napló_2026_05_17.txt
+    Bejegyzés formátuma: [08:32:15] szöveg...
+    Ha a felvétel éjfélen nyúlik át, MINDKÉT nap fájljába beírja a teljes bejegyzést.
+    """
+    os.makedirs(LOG_DIR, exist_ok=True)
+    end_dt = datetime.now()
+
+    start_str = start_dt.strftime("%H:%M:%S")
+    end_str   = end_dt.strftime("%H:%M:%S")
+
+    # Időbélyeg: ha ugyanaz a nap → [08:32:15], ha átnyúl → [23:58:01 → 00:01:33]
+    if start_dt.date() == end_dt.date():
+        stamp = f"[{start_str}]"
+    else:
+        stamp = f"[{start_str} → {end_str}]"
+
+    entry = f"{stamp}\n{text}\n\n"
+
+    # Kezdő nap fájlja
+    fname_start = os.path.join(LOG_DIR, f"whisper_napló_{start_dt.strftime('%Y_%m_%d')}.txt")
+    with open(fname_start, "a", encoding="utf-8") as f:
+        f.write(entry)
+
+    # Ha éjfélen nyúlna át: záró nap fájlja is megkapja a teljes bejegyzést
+    if start_dt.date() != end_dt.date():
+        fname_end = os.path.join(LOG_DIR, f"whisper_napló_{end_dt.strftime('%Y_%m_%d')}.txt")
+        with open(fname_end, "a", encoding="utf-8") as f:
+            f.write(entry)
+
 
 # --- KONFIGURÁCIÓ ---
 ctk.set_appearance_mode("dark")
@@ -275,12 +334,17 @@ class VoicetexApp(ctk.CTk):
         self.audio_data = []
         self.fs = 16000
         self.whisper_model = None
-        self.selected_device_id = None  # None = rendszer alapértelmezett
-        self._auto_stop_timer = None    # 5 másodperces auto-stop timer
-        self.target_hwnd = None         # Célablak handle (ahová beillesztünk)
-        self._vu_level   = 0.0          # Aktuális hangszint 0.0–1.0
-        self._vu_peak    = 0.0          # Csúcsjelző (lassan csökken)
-        self._monitor_stream = None     # Folyamatos figyelő stream (nem felvétel)
+        self.selected_device_id = None      # None = rendszer alapértelmezett
+        self._auto_stop_timer = None        # 5 másodperces auto-stop timer
+        self.target_hwnd = None             # Célablak handle (ahová beillesztünk)
+        self._vu_level   = 0.0              # Aktuális hangszint 0.0–1.0
+        self._vu_peak    = 0.0              # Csúcsjelző (lassan csökken)
+        self._monitor_stream = None         # Folyamatos figyelő stream (nem felvétel)
+        self._recording_start_time = None   # Felvétel kezdete (naplózáshoz)
+        self._tray_icon  = None             # Tálca ikon
+
+        # X gomb: elrejt a tálcára, nem zár be
+        self.protocol("WM_DELETE_WINDOW", self._hide_window)
 
         # --- UI Felépítése ---
         self.label = ctk.CTkLabel(self, text="Voicetex AI", font=("Segoe UI", 24, "bold"))
@@ -456,6 +520,7 @@ class VoicetexApp(ctk.CTk):
 
         threading.Thread(target=self.setup_hotkeys, daemon=True).start()
         threading.Thread(target=self._start_monitor_stream, daemon=True).start()
+        threading.Thread(target=self._setup_tray, daemon=True).start()
 
     # ------------------------------------------------------------------ #
     #  VU METER                                                           #
@@ -565,6 +630,52 @@ class VoicetexApp(ctk.CTk):
         if self.recording:
             self.audio_data.append(indata.copy())
 
+    # ------------------------------------------------------------------ #
+    #  TÁLCA (SYSTEM TRAY)                                               #
+    # ------------------------------------------------------------------ #
+
+    def _setup_tray(self):
+        """Létrehozza és elindítja a tálca ikont."""
+        menu = pystray.Menu(
+            pystray.MenuItem("Voicetex AI", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Megjelenítés", lambda icon, item: self._show_window()),
+            pystray.MenuItem("Elrejtés",     lambda icon, item: self._hide_window()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Kilépés",      lambda icon, item: self._quit_app()),
+        )
+        self._tray_icon = pystray.Icon(
+            name    = "voicetex",
+            icon    = _make_tray_image("#555577"),   # szürke = nincs modell
+            title   = "Voicetex AI – modell nincs betöltve",
+            menu    = menu
+        )
+        # Dupla kattintás: ablak előhozása
+        self._tray_icon.default_action = lambda icon, item: self._show_window()
+        self._tray_icon.run_detached()
+
+    def _update_tray(self, color: str, tooltip: str):
+        """Frissíti a tálca ikon színét és tooltip szövegét."""
+        if self._tray_icon:
+            self._tray_icon.icon  = _make_tray_image(color)
+            self._tray_icon.title = tooltip
+
+    def _show_window(self):
+        """Előhozza az ablakot a tálcáról."""
+        self.after(0, self.deiconify)
+        self.after(0, self.lift)
+        self.after(0, self.focus_force)
+
+    def _hide_window(self):
+        """Elrejti az ablakot (tálcán marad)."""
+        self.withdraw()
+
+    def _quit_app(self):
+        """Teljesen kilép az alkalmazásból."""
+        if self._tray_icon:
+            self._tray_icon.stop()
+        self.after(0, self.destroy)
+
     def on_device_change(self, selected):
         """Frissíti a kiválasztott eszköz ID-ját és infó feliratát."""
         try:
@@ -665,6 +776,7 @@ class VoicetexApp(ctk.CTk):
                     pass  # Ha valami miatt nem sikerül, a transcribe majd jelez
 
                 self.status_label.configure(text="Állapot: AI Online ✓  (Alt + Space)", text_color="green")
+                self._update_tray("#00c853", "Voicetex AI – Készen áll  (Alt+Space)")
 
             except Exception as e:
                 self.status_label.configure(text=f"Hiba: {str(e)[:100]}", text_color="red")
@@ -738,10 +850,12 @@ class VoicetexApp(ctk.CTk):
                 self.target_hwnd = get_foreground_window()
             self.recording = True
             self.audio_data = []
+            self._recording_start_time = datetime.now()
             self.status_label.configure(
                 text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / tartva: folytatja)",
                 text_color="red"
             )
+            self._update_tray("#ff1744", "Voicetex AI – 🎙️ Felvétel...")
             # 5 másodperces auto-stop indítása
             self._schedule_auto_stop()
             # Az adat gyűjtését a _monitor_callback végzi (mindig fut)
@@ -825,6 +939,12 @@ class VoicetexApp(ctk.CTk):
             paste_text_to_window(self.target_hwnd, text)
             self.target_hwnd = None     # reset, következő felvételnél újra olvassuk
 
+            # Naplózás
+            if self._recording_start_time:
+                save_to_log(text, self._recording_start_time)
+                self._recording_start_time = None
+
+            self._update_tray("#00c853", "Voicetex AI – Készen áll  (Alt+Space)")
             self.status_label.configure(text="Állapot: ✅ Beillesztve!", text_color="green")
 
         threading.Thread(target=_ai_task).start()
