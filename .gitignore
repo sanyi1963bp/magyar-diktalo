@@ -1,0 +1,29 @@
+# Ideiglenes hangfájl
+temp.wav
+
+# Letöltött / konvertált modellek (nagyok, ne kerüljenek GitHubra)
+voicetex_models/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtuális környezet
+venv/
+.venv/
+env/
+
+# IDE fájlok
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Naplófájlok
+*.log
