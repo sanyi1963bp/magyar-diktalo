@@ -187,6 +187,92 @@ def apply_voice_commands(text: str) -> str:
     # a sortöréseket (pl. "bekezdés" a szöveg elején/végén) megőrizzük!
     return text.strip(' \t')
 
+# --- MEL FILTERBANK JAVÍTÁS (standalone, faster-whisper verziófüggetlen) ---
+def _compute_mel_filters(n_mels: int, n_fft: int = 400, sr: int = 16000) -> np.ndarray:
+    """
+    Kiszámolja a Whisper-kompatibilis mel szűrőmátrixot.
+    Visszatérési alak: (n_mels, n_fft//2 + 1)
+    Ugyanaz a képlet mint az openai/whisper-ben.
+    """
+    f_min, f_max = 0.0, 8000.0
+
+    def hz_to_mel(f):
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+
+    def mel_to_hz(m):
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)          # (n_fft//2+1,)
+    mel_pts = np.linspace(hz_to_mel(f_min), hz_to_mel(f_max), n_mels + 2)
+    hz_pts  = mel_to_hz(mel_pts)
+
+    filters = np.zeros((n_mels, len(freqs)), dtype=np.float32)
+    for i in range(n_mels):
+        lo, mid, hi = hz_pts[i], hz_pts[i + 1], hz_pts[i + 2]
+        up   = np.maximum(0.0, (freqs - lo)  / (mid - lo))
+        down = np.maximum(0.0, (hi - freqs)  / (hi - mid))
+        filters[i] = np.minimum(up, down)
+
+    # Energia-normalizálás (mint a whisper-ben)
+    enorm = 2.0 / (hz_pts[2:n_mels + 2] - hz_pts[:n_mels])
+    filters *= enorm[:, np.newaxis]
+    return filters
+
+
+def fix_mel_bins(whisper_model) -> bool:
+    """
+    Megvizsgálja, hogy a modell és a feature extractor mel-száma egyezik-e.
+    Ha nem, kijavítja. Visszaad True-t ha javítás történt, False-t ha nem kellett.
+    Sosem dob kivételt – ha nem sikerül, False-t ad.
+    """
+    try:
+        model_mels = whisper_model.model.n_mels
+    except Exception:
+        return False   # n_mels nem olvasható, hagyjuk
+
+    try:
+        extractor_mels = whisper_model.feature_extractor.mel_filters.shape[0]
+    except Exception:
+        return False
+
+    if model_mels == extractor_mels:
+        return False   # Nem kell javítás
+
+    # --- 1. módszer: FeatureExtractor osztály cseréje ---
+    for module in ["faster_whisper.feature_extractor", "faster_whisper.audio", "faster_whisper"]:
+        try:
+            import importlib
+            mod = importlib.import_module(module)
+            FE  = getattr(mod, "FeatureExtractor")
+            # Próbáljuk az összes lehetséges konstruktor-szignatúrát
+            for kwargs in [
+                {"device": "cuda", "num_mel_bins": model_mels},
+                {"num_mel_bins": model_mels},
+                {"n_mels": model_mels},
+                {},
+            ]:
+                try:
+                    new_fe = FE(**kwargs)
+                    # Ha az alap n_mels nem stimmel, patch-eljük a mel_filters mátrixot
+                    if new_fe.mel_filters.shape[0] != model_mels:
+                        new_fe.mel_filters = _compute_mel_filters(model_mels)
+                    whisper_model.feature_extractor = new_fe
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # --- 2. módszer: Közvetlenül patch-eljük a mel_filters mátrixot ---
+    try:
+        whisper_model.feature_extractor.mel_filters = _compute_mel_filters(model_mels)
+        return True
+    except Exception:
+        pass
+
+    return False   # Egyik módszer sem működött
+
+
 # --- GPU / CPU DETEKTÁLÁS ---
 def detect_device():
     """
@@ -759,21 +845,7 @@ class VoicetexApp(ctk.CTk):
                         self.whisper_model = WhisperModel(load_path, device="cuda", compute_type="int8_float16")
 
                 # --- MEL BINS JAVÍTÁS ---
-                # A faster-whisper néha 80 mel-bines feature extractort hoz létre
-                # akkor is, ha a modell 128-at vár (large-v3 alapú modellek).
-                # A modell saját n_mels értékét olvassuk ki és ha eltér, lecseréljük
-                # a feature extractort a helyes értékkel.
-                try:
-                    from faster_whisper.feature_extractor import FeatureExtractor as FE
-                    model_mels = self.whisper_model.model.n_mels
-                    extractor_mels = self.whisper_model.feature_extractor.mel_filters.shape[0]
-                    if model_mels != extractor_mels:
-                        self.whisper_model.feature_extractor = FE(
-                            device=DEVICE,
-                            num_mel_bins=model_mels
-                        )
-                except Exception:
-                    pass  # Ha valami miatt nem sikerül, a transcribe majd jelez
+                fix_mel_bins(self.whisper_model)
 
                 self.status_label.configure(text="Állapot: AI Online ✓  (Alt + Space)", text_color="green")
                 self._update_tray("#00c853", "Voicetex AI – Készen áll  (Alt+Space)")
