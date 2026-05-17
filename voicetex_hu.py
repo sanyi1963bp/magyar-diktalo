@@ -9,9 +9,6 @@ from faster_whisper import WhisperModel
 import ollama
 import pyautogui
 import pyperclip
-import pystray
-from PIL import Image, ImageDraw
-from datetime import datetime
 import os
 import re
 import subprocess
@@ -64,62 +61,6 @@ def paste_text_to_window(hwnd, text):
         if i < len(lines) - 1:  # Ha nem az utolsó sor: Enter
             pyautogui.press('enter')
             time.sleep(0.08)
-
-# --- TÁLCA IKON RAJZOLÁS ---
-def _make_tray_image(color: str = "#4a9eff") -> Image.Image:
-    """
-    64×64 px tálca ikont készít: sötét háttér + színes kör.
-    Szín: kék=készen áll, piros=felvétel, szürke=nincs modell.
-    """
-    def hex_to_rgb(h):
-        h = h.lstrip("#")
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-    img  = Image.new("RGB", (64, 64), (28, 28, 46))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([6, 6, 58, 58], fill=hex_to_rgb(color))
-    # Kis mikrofon szimbólum: fehér téglalap + félkör
-    draw.rectangle([26, 18, 38, 38], fill=(255, 255, 255))
-    draw.ellipse([22, 28, 42, 46], fill=(255, 255, 255))
-    draw.rectangle([26, 44, 38, 52], fill=(255, 255, 255))
-    return img
-
-
-# --- NAPLÓZÁS ---
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "napló")
-
-def save_to_log(text: str, start_dt: datetime):
-    """
-    Elmenti a felismert szöveget napi naplófájlba.
-    Fájlnév: whisper_napló_2026_05_17.txt
-    Bejegyzés formátuma: [08:32:15] szöveg...
-    Ha a felvétel éjfélen nyúlik át, MINDKÉT nap fájljába beírja a teljes bejegyzést.
-    """
-    os.makedirs(LOG_DIR, exist_ok=True)
-    end_dt = datetime.now()
-
-    start_str = start_dt.strftime("%H:%M:%S")
-    end_str   = end_dt.strftime("%H:%M:%S")
-
-    # Időbélyeg: ha ugyanaz a nap → [08:32:15], ha átnyúl → [23:58:01 → 00:01:33]
-    if start_dt.date() == end_dt.date():
-        stamp = f"[{start_str}]"
-    else:
-        stamp = f"[{start_str} → {end_str}]"
-
-    entry = f"{stamp}\n{text}\n\n"
-
-    # Kezdő nap fájlja
-    fname_start = os.path.join(LOG_DIR, f"whisper_napló_{start_dt.strftime('%Y_%m_%d')}.txt")
-    with open(fname_start, "a", encoding="utf-8") as f:
-        f.write(entry)
-
-    # Ha éjfélen nyúlna át: záró nap fájlja is megkapja a teljes bejegyzést
-    if start_dt.date() != end_dt.date():
-        fname_end = os.path.join(LOG_DIR, f"whisper_napló_{end_dt.strftime('%Y_%m_%d')}.txt")
-        with open(fname_end, "a", encoding="utf-8") as f:
-            f.write(entry)
-
 
 # --- KONFIGURÁCIÓ ---
 ctk.set_appearance_mode("dark")
@@ -186,92 +127,6 @@ def apply_voice_commands(text: str) -> str:
     # Csak szóközöket és tabulátorokat vágunk le a szélekről,
     # a sortöréseket (pl. "bekezdés" a szöveg elején/végén) megőrizzük!
     return text.strip(' \t')
-
-# --- MEL FILTERBANK JAVÍTÁS (standalone, faster-whisper verziófüggetlen) ---
-def _compute_mel_filters(n_mels: int, n_fft: int = 400, sr: int = 16000) -> np.ndarray:
-    """
-    Kiszámolja a Whisper-kompatibilis mel szűrőmátrixot.
-    Visszatérési alak: (n_mels, n_fft//2 + 1)
-    Ugyanaz a képlet mint az openai/whisper-ben.
-    """
-    f_min, f_max = 0.0, 8000.0
-
-    def hz_to_mel(f):
-        return 2595.0 * np.log10(1.0 + f / 700.0)
-
-    def mel_to_hz(m):
-        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
-
-    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)          # (n_fft//2+1,)
-    mel_pts = np.linspace(hz_to_mel(f_min), hz_to_mel(f_max), n_mels + 2)
-    hz_pts  = mel_to_hz(mel_pts)
-
-    filters = np.zeros((n_mels, len(freqs)), dtype=np.float32)
-    for i in range(n_mels):
-        lo, mid, hi = hz_pts[i], hz_pts[i + 1], hz_pts[i + 2]
-        up   = np.maximum(0.0, (freqs - lo)  / (mid - lo))
-        down = np.maximum(0.0, (hi - freqs)  / (hi - mid))
-        filters[i] = np.minimum(up, down)
-
-    # Energia-normalizálás (mint a whisper-ben)
-    enorm = 2.0 / (hz_pts[2:n_mels + 2] - hz_pts[:n_mels])
-    filters *= enorm[:, np.newaxis]
-    return filters
-
-
-def fix_mel_bins(whisper_model) -> bool:
-    """
-    Megvizsgálja, hogy a modell és a feature extractor mel-száma egyezik-e.
-    Ha nem, kijavítja. Visszaad True-t ha javítás történt, False-t ha nem kellett.
-    Sosem dob kivételt – ha nem sikerül, False-t ad.
-    """
-    try:
-        model_mels = whisper_model.model.n_mels
-    except Exception:
-        return False   # n_mels nem olvasható, hagyjuk
-
-    try:
-        extractor_mels = whisper_model.feature_extractor.mel_filters.shape[0]
-    except Exception:
-        return False
-
-    if model_mels == extractor_mels:
-        return False   # Nem kell javítás
-
-    # --- 1. módszer: FeatureExtractor osztály cseréje ---
-    for module in ["faster_whisper.feature_extractor", "faster_whisper.audio", "faster_whisper"]:
-        try:
-            import importlib
-            mod = importlib.import_module(module)
-            FE  = getattr(mod, "FeatureExtractor")
-            # Próbáljuk az összes lehetséges konstruktor-szignatúrát
-            for kwargs in [
-                {"device": "cuda", "num_mel_bins": model_mels},
-                {"num_mel_bins": model_mels},
-                {"n_mels": model_mels},
-                {},
-            ]:
-                try:
-                    new_fe = FE(**kwargs)
-                    # Ha az alap n_mels nem stimmel, patch-eljük a mel_filters mátrixot
-                    if new_fe.mel_filters.shape[0] != model_mels:
-                        new_fe.mel_filters = _compute_mel_filters(model_mels)
-                    whisper_model.feature_extractor = new_fe
-                    return True
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    # --- 2. módszer: Közvetlenül patch-eljük a mel_filters mátrixot ---
-    try:
-        whisper_model.feature_extractor.mel_filters = _compute_mel_filters(model_mels)
-        return True
-    except Exception:
-        pass
-
-    return False   # Egyik módszer sem működött
-
 
 # --- GPU / CPU DETEKTÁLÁS ---
 def detect_device():
@@ -420,17 +275,12 @@ class VoicetexApp(ctk.CTk):
         self.audio_data = []
         self.fs = 16000
         self.whisper_model = None
-        self.selected_device_id = None      # None = rendszer alapértelmezett
-        self._auto_stop_timer = None        # 5 másodperces auto-stop timer
-        self.target_hwnd = None             # Célablak handle (ahová beillesztünk)
-        self._vu_level   = 0.0              # Aktuális hangszint 0.0–1.0
-        self._vu_peak    = 0.0              # Csúcsjelző (lassan csökken)
-        self._monitor_stream = None         # Folyamatos figyelő stream (nem felvétel)
-        self._recording_start_time = None   # Felvétel kezdete (naplózáshoz)
-        self._tray_icon  = None             # Tálca ikon
-
-        # X gomb: elrejt a tálcára, nem zár be
-        self.protocol("WM_DELETE_WINDOW", self._hide_window)
+        self.selected_device_id = None  # None = rendszer alapértelmezett
+        self._auto_stop_timer = None    # 5 másodperces auto-stop timer
+        self.target_hwnd = None         # Célablak handle (ahová beillesztünk)
+        self._vu_level   = 0.0          # Aktuális hangszint 0.0–1.0
+        self._vu_peak    = 0.0          # Csúcsjelző (lassan csökken)
+        self._monitor_stream = None     # Folyamatos figyelő stream (nem felvétel)
 
         # --- UI Felépítése ---
         self.label = ctk.CTkLabel(self, text="Voicetex AI", font=("Segoe UI", 24, "bold"))
@@ -606,7 +456,6 @@ class VoicetexApp(ctk.CTk):
 
         threading.Thread(target=self.setup_hotkeys, daemon=True).start()
         threading.Thread(target=self._start_monitor_stream, daemon=True).start()
-        threading.Thread(target=self._setup_tray, daemon=True).start()
 
     # ------------------------------------------------------------------ #
     #  VU METER                                                           #
@@ -716,52 +565,6 @@ class VoicetexApp(ctk.CTk):
         if self.recording:
             self.audio_data.append(indata.copy())
 
-    # ------------------------------------------------------------------ #
-    #  TÁLCA (SYSTEM TRAY)                                               #
-    # ------------------------------------------------------------------ #
-
-    def _setup_tray(self):
-        """Létrehozza és elindítja a tálca ikont."""
-        menu = pystray.Menu(
-            pystray.MenuItem("Voicetex AI", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Megjelenítés", lambda icon, item: self._show_window()),
-            pystray.MenuItem("Elrejtés",     lambda icon, item: self._hide_window()),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Kilépés",      lambda icon, item: self._quit_app()),
-        )
-        self._tray_icon = pystray.Icon(
-            name    = "voicetex",
-            icon    = _make_tray_image("#555577"),   # szürke = nincs modell
-            title   = "Voicetex AI – modell nincs betöltve",
-            menu    = menu
-        )
-        # Dupla kattintás: ablak előhozása
-        self._tray_icon.default_action = lambda icon, item: self._show_window()
-        self._tray_icon.run_detached()
-
-    def _update_tray(self, color: str, tooltip: str):
-        """Frissíti a tálca ikon színét és tooltip szövegét."""
-        if self._tray_icon:
-            self._tray_icon.icon  = _make_tray_image(color)
-            self._tray_icon.title = tooltip
-
-    def _show_window(self):
-        """Előhozza az ablakot a tálcáról."""
-        self.after(0, self.deiconify)
-        self.after(0, self.lift)
-        self.after(0, self.focus_force)
-
-    def _hide_window(self):
-        """Elrejti az ablakot (tálcán marad)."""
-        self.withdraw()
-
-    def _quit_app(self):
-        """Teljesen kilép az alkalmazásból."""
-        if self._tray_icon:
-            self._tray_icon.stop()
-        self.after(0, self.destroy)
-
     def on_device_change(self, selected):
         """Frissíti a kiválasztott eszköz ID-ját és infó feliratát."""
         try:
@@ -845,10 +648,23 @@ class VoicetexApp(ctk.CTk):
                         self.whisper_model = WhisperModel(load_path, device="cuda", compute_type="int8_float16")
 
                 # --- MEL BINS JAVÍTÁS ---
-                fix_mel_bins(self.whisper_model)
+                # A faster-whisper néha 80 mel-bines feature extractort hoz létre
+                # akkor is, ha a modell 128-at vár (large-v3 alapú modellek).
+                # A modell saját n_mels értékét olvassuk ki és ha eltér, lecseréljük
+                # a feature extractort a helyes értékkel.
+                try:
+                    from faster_whisper.feature_extractor import FeatureExtractor as FE
+                    model_mels = self.whisper_model.model.n_mels
+                    extractor_mels = self.whisper_model.feature_extractor.mel_filters.shape[0]
+                    if model_mels != extractor_mels:
+                        self.whisper_model.feature_extractor = FE(
+                            device=DEVICE,
+                            num_mel_bins=model_mels
+                        )
+                except Exception:
+                    pass  # Ha valami miatt nem sikerül, a transcribe majd jelez
 
                 self.status_label.configure(text="Állapot: AI Online ✓  (Alt + Space)", text_color="green")
-                self._update_tray("#00c853", "Voicetex AI – Készen áll  (Alt+Space)")
 
             except Exception as e:
                 self.status_label.configure(text=f"Hiba: {str(e)[:100]}", text_color="red")
@@ -922,12 +738,10 @@ class VoicetexApp(ctk.CTk):
                 self.target_hwnd = get_foreground_window()
             self.recording = True
             self.audio_data = []
-            self._recording_start_time = datetime.now()
             self.status_label.configure(
                 text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / tartva: folytatja)",
                 text_color="red"
             )
-            self._update_tray("#ff1744", "Voicetex AI – 🎙️ Felvétel...")
             # 5 másodperces auto-stop indítása
             self._schedule_auto_stop()
             # Az adat gyűjtését a _monitor_callback végzi (mindig fut)
@@ -1011,12 +825,6 @@ class VoicetexApp(ctk.CTk):
             paste_text_to_window(self.target_hwnd, text)
             self.target_hwnd = None     # reset, következő felvételnél újra olvassuk
 
-            # Naplózás
-            if self._recording_start_time:
-                save_to_log(text, self._recording_start_time)
-                self._recording_start_time = None
-
-            self._update_tray("#00c853", "Voicetex AI – Készen áll  (Alt+Space)")
             self.status_label.configure(text="Állapot: ✅ Beillesztve!", text_color="green")
 
         threading.Thread(target=_ai_task).start()
