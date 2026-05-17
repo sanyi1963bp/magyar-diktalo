@@ -62,6 +62,38 @@ def paste_text_to_window(hwnd, text):
             pyautogui.press('enter')
             time.sleep(0.08)
 
+# --- MEL FILTERBANK JAVÍTÁS ---
+def _compute_mel_filters(n_mels: int, n_fft: int = 400, sr: int = 16000) -> np.ndarray:
+    """Whisper-kompatibilis mel szűrőmátrix: (n_mels, n_fft//2+1)."""
+    def hz_to_mel(f): return 2595.0 * np.log10(1.0 + f / 700.0)
+    def mel_to_hz(m): return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+    freqs   = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    mel_pts = np.linspace(hz_to_mel(0.0), hz_to_mel(8000.0), n_mels + 2)
+    hz_pts  = mel_to_hz(mel_pts)
+    filters = np.zeros((n_mels, len(freqs)), dtype=np.float32)
+    for i in range(n_mels):
+        lo, mid, hi = hz_pts[i], hz_pts[i+1], hz_pts[i+2]
+        filters[i]  = np.minimum(np.maximum(0.0, (freqs-lo)/(mid-lo)),
+                                 np.maximum(0.0, (hi-freqs)/(hi-mid)))
+    filters *= (2.0 / (hz_pts[2:n_mels+2] - hz_pts[:n_mels]))[:, np.newaxis]
+    return filters
+
+
+def fix_mel_bins(model) -> None:
+    """
+    Ha a modell és a feature extractor mel-száma eltér (pl. large-v3: 128 vs 80),
+    közvetlenül kicseréli a mel_filters mátrixot. Osztálypéldányosítás nélkül,
+    verziófüggetlen.
+    """
+    try:
+        model_mels    = model.model.n_mels
+        extractor_mels = model.feature_extractor.mel_filters.shape[0]
+        if model_mels != extractor_mels:
+            model.feature_extractor.mel_filters = _compute_mel_filters(model_mels)
+    except Exception as e:
+        print(f"[fix_mel_bins] {e}")
+
+
 # --- KONFIGURÁCIÓ ---
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -648,21 +680,7 @@ class VoicetexApp(ctk.CTk):
                         self.whisper_model = WhisperModel(load_path, device="cuda", compute_type="int8_float16")
 
                 # --- MEL BINS JAVÍTÁS ---
-                # A faster-whisper néha 80 mel-bines feature extractort hoz létre
-                # akkor is, ha a modell 128-at vár (large-v3 alapú modellek).
-                # A modell saját n_mels értékét olvassuk ki és ha eltér, lecseréljük
-                # a feature extractort a helyes értékkel.
-                try:
-                    from faster_whisper.feature_extractor import FeatureExtractor as FE
-                    model_mels = self.whisper_model.model.n_mels
-                    extractor_mels = self.whisper_model.feature_extractor.mel_filters.shape[0]
-                    if model_mels != extractor_mels:
-                        self.whisper_model.feature_extractor = FE(
-                            device=DEVICE,
-                            num_mel_bins=model_mels
-                        )
-                except Exception:
-                    pass  # Ha valami miatt nem sikerül, a transcribe majd jelez
+                fix_mel_bins(self.whisper_model)
 
                 self.status_label.configure(text="Állapot: AI Online ✓  (Alt + Space)", text_color="green")
 
