@@ -7,7 +7,11 @@ import sounddevice as sd
 import numpy as np
 from scipy.io import wavfile
 from faster_whisper import WhisperModel
-import ollama
+try:
+    from llama_cpp import Llama as LlamaCpp
+    LLAMA_CPP_OK = True
+except ImportError:
+    LLAMA_CPP_OK = False
 import pyautogui
 import pyperclip
 import os
@@ -189,6 +193,75 @@ MODELS = {
 }
 
 VALID_MODELS = {k: v for k, v in MODELS.items() if v is not None}
+
+# --- LLM MOTOR (llama-cpp-python, Ollama nélkül) ---
+LLM_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_models")
+LLM_REPO  = "bartowski/Phi-3.5-mini-instruct-GGUF"
+LLM_FILE  = "Phi-3.5-mini-instruct-Q4_K_M.gguf"
+
+_llm_engine      = None   # betöltött LlamaCpp példány
+_llm_engine_lock = threading.Lock()
+
+
+def _download_llm_if_needed(status_cb) -> str:
+    """Letölti a GGUF modellt ha még nincs meg. Visszaadja a helyi útvonalat."""
+    os.makedirs(LLM_DIR, exist_ok=True)
+    path = os.path.join(LLM_DIR, LLM_FILE)
+    if not os.path.exists(path):
+        status_cb(f"LLM letöltése: {LLM_FILE}  (~2.4 GB, csak egyszer)...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id=LLM_REPO, filename=LLM_FILE, local_dir=LLM_DIR)
+    return path
+
+
+def _load_llm_engine(status_cb=lambda _: None):
+    """Betölti a Phi-3.5 modellt. Szálbiztos, csak egyszer fut le."""
+    global _llm_engine
+    with _llm_engine_lock:
+        if _llm_engine is not None:
+            return _llm_engine
+        if not LLAMA_CPP_OK:
+            status_cb("llama-cpp-python nincs telepítve – LLM kikapcsolva")
+            return None
+        try:
+            path = _download_llm_if_needed(status_cb)
+            status_cb("LLM betöltése GPU-ra...")
+            _llm_engine = LlamaCpp(
+                model_path  = path,
+                n_gpu_layers= -1 if DEVICE == "cuda" else 0,
+                n_ctx       = 512,
+                verbose     = False,
+            )
+        except Exception as e:
+            status_cb(f"LLM hiba: {e}")
+            return None
+    return _llm_engine
+
+
+def llm_correct(text: str) -> str:
+    """
+    Phi-3.5 alapú magyar szövegjavítás.
+    Ha az engine nem elérhető, az eredeti szöveget adja vissza.
+    """
+    engine = _llm_engine
+    if engine is None:
+        return text
+    prompt = (
+        "<|user|>\n"
+        "Javítsd ki ezt a magyar szöveget.\n"
+        "1. Töröld a töltelékszavakat (hát, ugye, szóval, tehát).\n"
+        "2. Javítsd a helyesírást, tedd ki a hiányzó ékezeteket.\n"
+        "3. Csak a tiszta, javított szöveget add vissza, semmi mást.\n\n"
+        f"Szöveg: {text}"
+        "<|end|>\n<|assistant|>\n"
+    )
+    try:
+        result = engine(prompt, max_tokens=300,
+                        stop=["<|end|>", "<|user|>"], echo=False)
+        corrected = result["choices"][0]["text"].strip()
+        return corrected if corrected else text
+    except Exception:
+        return text
 
 
 def get_local_model_path(model_id: str) -> str:
@@ -383,12 +456,12 @@ class VoicetexApp(ctk.CTk):
         self.model_info.pack(pady=(0, 10))
 
         # --- LLM javító ---
-        self.llm_label = ctk.CTkLabel(self, text="Szövegjavító (Llama/Ollama):")
+        self.llm_label = ctk.CTkLabel(self, text="Szövegjavító (Phi-3.5, offline):")
         self.llm_label.pack()
         self.llm_var = ctk.StringVar(value="nincs")
         self.llm_menu = ctk.CTkOptionMenu(
             self,
-            values=["llama3", "mistral", "phi3", "nincs"],
+            values=["Phi-3.5 (llama-cpp)", "nincs"],
             variable=self.llm_var,
             width=320
         )
@@ -616,9 +689,25 @@ class VoicetexApp(ctk.CTk):
                 pass
 
     def _auto_load(self):
-        """Automatikusan betölti az induláskor kiválasztott modellt."""
+        """Automatikusan betölti a Whisper modellt és előkészíti a Phi-3.5 LLM-et."""
         self.load_models()
+        threading.Thread(target=self._prepare_llm, daemon=True).start()
         self._set_ui_loading(False)
+
+    def _prepare_llm(self):
+        """
+        Háttérben betölti a Phi-3.5 GGUF modellt (llama-cpp-python).
+        Ha még nincs letöltve, automatikusan letölti a HuggingFace-ről (~2.4 GB, csak egyszer).
+        Betöltés után átállítja az LLM menüt.
+        """
+        def _status(msg):
+            self.after(0, lambda m=msg: self.status_label.configure(
+                text=f"Állapot: {m}", text_color="yellow"
+            ))
+
+        engine = _load_llm_engine(_status)
+        if engine is not None:
+            self.after(0, lambda: self.llm_var.set("Phi-3.5 (llama-cpp)"))
 
     # ------------------------------------------------------------------ #
     #  LEBEGŐ FELVÉTEL-JELZŐ                                             #
@@ -798,12 +887,12 @@ class VoicetexApp(ctk.CTk):
         dn   = event.event_type == keyboard.KEY_DOWN
         up   = event.event_type == keyboard.KEY_UP
 
-        if name in ('windows', 'left windows', 'right windows'):
+        if name == 'left windows':
             self._win_held = dn
             if up and self.recording:
                 self._stop_and_process()
 
-        elif name in ('ctrl', 'left ctrl', 'right ctrl'):
+        elif name == 'left ctrl':
             self._ctrl_held = dn
             if dn and self._win_held:
                 self.start_recording()
@@ -838,7 +927,7 @@ class VoicetexApp(ctk.CTk):
         """5 mp lejártakor: ha még nyomva tartja → folytatás; ha elengedte → leállás."""
         if not self.recording:
             return
-        if keyboard.is_pressed('windows') and keyboard.is_pressed('ctrl'):
+        if keyboard.is_pressed('left windows') and keyboard.is_pressed('left ctrl'):
             # Még nyomja → új 5 másodperces kör
             self._schedule_auto_stop()
         else:
@@ -915,26 +1004,9 @@ class VoicetexApp(ctk.CTk):
             # 1. lépés: szabályalapú hangparancsok alkalmazása (LLM nélkül is működik)
             text = apply_voice_commands(text)
 
-            # 2. lépés: LLM javítás (ha be van kapcsolva) — a parancsokat is kezeli
+            # 2. lépés: LLM javítás (ha be van kapcsolva)
             if self.llm_var.get() != "nincs":
-                try:
-                    response = ollama.generate(
-                        model=self.llm_var.get(),
-                        prompt=(
-                            f"Javítsd ki ezt a magyar szöveget. Feladataid:\n"
-                            f"1. Töröld a töltelékszavakat (hát, ugye, szóval, tehát).\n"
-                            f"2. Javítsd a helyesírást, tedd ki a hiányzó ékezeteket.\n"
-                            f"3. Ha még maradt benne hangparancs szóval kimondva, alakítsd át: "
-                            f"'pont' (mondat végén) → '.', 'kérdőjel' → '?', 'felkiáltójel' → '!', "
-                            f"'vessző' → ',', 'nagybetű' → az előző szót nagybetűvel, "
-                            f"'új sor' → sortörés, 'bekezdés' → bekezdés.\n"
-                            f"4. Csak a tiszta, kész szöveget add vissza, semmi mást.\n\n"
-                            f"Szöveg: {text}"
-                        )
-                    )
-                    text = response['response'].strip()
-                except Exception:
-                    pass
+                text = llm_correct(text)
 
             paste_text_to_window(self.target_hwnd, text)
             self.target_hwnd = None     # reset, következő felvételnél újra olvassuk
