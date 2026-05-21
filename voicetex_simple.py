@@ -317,6 +317,7 @@ class VoicetexApp(ctk.CTk):
         while True:
             try:
                 with sd.InputStream(samplerate=self.fs, channels=1,
+                                    device=3,
                                     callback=self._monitor_callback,
                                     blocksize=1024):
                     while True:
