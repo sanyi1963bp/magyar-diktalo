@@ -482,6 +482,13 @@ class VoicetexApp(ctk.CTk):
         threading.Thread(target=self.setup_hotkeys, daemon=True).start()
         threading.Thread(target=self._start_monitor_stream, daemon=True).start()
 
+        # Lebegő felvétel-jelző ablak (mindig látható, fókusztól függetlenül)
+        self._build_recording_indicator()
+
+        # Auto-betöltés: 300ms késleltetés hogy az UI teljesen felépüljön
+        self._set_ui_loading(True)
+        self.after(300, lambda: threading.Thread(target=self._auto_load, daemon=True).start())
+
     # ------------------------------------------------------------------ #
     #  VU METER                                                           #
     # ------------------------------------------------------------------ #
@@ -590,6 +597,77 @@ class VoicetexApp(ctk.CTk):
         if self.recording:
             with self._audio_lock:
                 self.audio_data.append(indata.copy())
+
+    # ------------------------------------------------------------------ #
+    #  DIMMING + AUTO-LOAD                                               #
+    # ------------------------------------------------------------------ #
+
+    def _set_ui_loading(self, loading: bool):
+        """Betöltés közben elhalványítja és letiltja az összes vezérlőt."""
+        alpha  = 0.55 if loading else 1.0
+        state  = "disabled" if loading else "normal"
+        self.after(0, lambda: self.attributes('-alpha', alpha))
+        for widget in (self.load_button, self.refresh_button,
+                       self.model_menu, self.device_menu, self.llm_menu,
+                       self.newline_btn, self.paragraph_btn):
+            try:
+                self.after(0, lambda w=widget, s=state: w.configure(state=s))
+            except Exception:
+                pass
+
+    def _auto_load(self):
+        """Automatikusan betölti az induláskor kiválasztott modellt."""
+        self.load_models()
+        self._set_ui_loading(False)
+
+    # ------------------------------------------------------------------ #
+    #  LEBEGŐ FELVÉTEL-JELZŐ                                             #
+    # ------------------------------------------------------------------ #
+
+    def _build_recording_indicator(self):
+        """
+        Kis mindig-látható ablak a képernyő jobb alsó sarkában.
+        Felvétel közben piros villogással jelzi az állapotot –
+        akkor is látszik ha a Voicetex nincs fókuszban.
+        """
+        ind = tk.Toplevel(self)
+        ind.overrideredirect(True)          # nincs title bar / keret
+        ind.attributes('-topmost', True)    # mindig legfelül
+        ind.attributes('-alpha', 0.0)       # kezdetben láthatatlan
+        ind.configure(bg="#1a0000")
+
+        w, h = 170, 38
+        sw = ind.winfo_screenwidth()
+        sh = ind.winfo_screenheight()
+        ind.geometry(f"{w}x{h}+{sw - w - 12}+{sh - h - 52}")
+
+        lbl = tk.Label(ind, text="🎙  FELVÉTEL",
+                       font=("Segoe UI", 13, "bold"),
+                       fg="#ff4444", bg="#1a0000")
+        lbl.pack(fill="both", expand=True)
+
+        self._indicator     = ind
+        self._indicator_lbl = lbl
+        self._indicator_blink_on = False
+
+    def _show_indicator(self, visible: bool):
+        """Megjeleníti vagy elrejti a lebegő jelzőt."""
+        if not hasattr(self, '_indicator'):
+            return
+        if visible:
+            self._indicator.attributes('-alpha', 0.92)
+            self._blink_indicator()
+        else:
+            self._indicator.attributes('-alpha', 0.0)
+
+    def _blink_indicator(self):
+        """Felvétel közben villogó piros jelző."""
+        if not self.recording:
+            return
+        self._indicator_blink_on = not self._indicator_blink_on
+        color = "#ff2222" if self._indicator_blink_on else "#661111"
+        self._indicator_lbl.configure(fg=color)
+        self.after(400, self._blink_indicator)
 
     def on_device_change(self, selected):
         """Frissíti a kiválasztott eszköz ID-ját és infó feliratát."""
@@ -702,21 +780,46 @@ class VoicetexApp(ctk.CTk):
         pyautogui.press('enter')
 
     def setup_hotkeys(self):
-        # Alt + Space egyszerre → felvétel indítása
-        keyboard.add_hotkey('alt+space', self.start_recording, suppress=True)
-        # Bármelyik felengedésekor → leállítás (ha éppen felvesz)
-        keyboard.on_release_key('alt', self._on_key_release)
-        keyboard.on_release_key('space', self._on_key_release)
-        # Sortörés billentyűk — globálisan, bármely alkalmazásban
-        keyboard.add_hotkey('scroll lock', self.insert_line_break,  suppress=True)
-        keyboard.add_hotkey('pause',       self.insert_paragraph,   suppress=True)
+        """
+        Megbízható globális hotkey detektálás keyboard.hook segítségével.
+        Az add_hotkey néha kihagyja ha az app nincs fókuszban – a hook mindig tüzel.
+        """
+        self._alt_held   = False
+        self._space_held = False
+
+        keyboard.hook(self._on_keyboard_event, suppress=False)
+        # Sortörés billentyűk (ezek egyszerű kombinációk, add_hotkey elég)
+        keyboard.add_hotkey('scroll lock', self.insert_line_break, suppress=True)
+        keyboard.add_hotkey('pause',       self.insert_paragraph,  suppress=True)
+
+    def _on_keyboard_event(self, event):
+        """Minden billentyű eseményt figyel; Alt+Space kombinációt kezeli."""
+        name = event.name.lower() if event.name else ''
+        dn   = event.event_type == keyboard.KEY_DOWN
+        up   = event.event_type == keyboard.KEY_UP
+
+        if name in ('alt', 'left alt', 'right alt'):
+            self._alt_held = dn
+            if up and self.recording:
+                self._stop_and_process()
+
+        elif name == 'space':
+            self._space_held = dn
+            if dn and self._alt_held:
+                self.start_recording()
+            elif up and self.recording:
+                self._stop_and_process()
+
+    def _stop_and_process(self):
+        """Leállítja a felvételt és elindítja a feldolgozást."""
+        self._cancel_auto_stop()
+        self.recording = False
+        self._show_indicator(False)
+        self.process_audio()
 
     def _on_key_release(self, event):
-        """Ha elengedik valamelyik gombot, leállítja a felvételt."""
-        if self.recording:
-            self._cancel_auto_stop()
-            self.recording = False
-            self.process_audio()
+        """Megtartjuk kompatibilitás miatt."""
+        pass
 
     def _schedule_auto_stop(self):
         """5 másodperces auto-stop timer indítása."""
@@ -755,6 +858,7 @@ class VoicetexApp(ctk.CTk):
                 text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / tartva: folytatja)",
                 text_color="red"
             )
+            self.after(0, lambda: self._show_indicator(True))
             # 5 másodperces auto-stop indítása
             self._schedule_auto_stop()
             # Az adat gyűjtését a _monitor_callback végzi (mindig fut)
@@ -835,6 +939,7 @@ class VoicetexApp(ctk.CTk):
             paste_text_to_window(self.target_hwnd, text)
             self.target_hwnd = None     # reset, következő felvételnél újra olvassuk
 
+            self.after(0, lambda: self._show_indicator(False))
             self.status_label.configure(text="Állapot: ✅ Beillesztve!", text_color="green")
 
         threading.Thread(target=_ai_task).start()
