@@ -453,7 +453,7 @@ class VoicetexApp(ctk.CTk):
                      font=("Segoe UI", 9), text_color="gray40").pack(pady=(2, 0))
 
         # --- Használati útmutató ---
-        info_text = "Alt + Space → felvétel indul\n5 mp után auto-leáll  |  tovább tartva: folytatja\nElengedéskor: azonnal feldolgoz és beilleszt"
+        info_text = "Win + Ctrl → felvétel indul\n5 mp után auto-leáll  |  tovább tartva: folytatja\nElengedéskor: azonnal feldolgoz és beilleszt"
         self.help_label = ctk.CTkLabel(self, text=info_text, font=("Segoe UI", 10), text_color="gray")
         self.help_label.pack(pady=(12, 5))
 
@@ -784,8 +784,8 @@ class VoicetexApp(ctk.CTk):
         Megbízható globális hotkey detektálás keyboard.hook segítségével.
         Az add_hotkey néha kihagyja ha az app nincs fókuszban – a hook mindig tüzel.
         """
-        self._alt_held   = False
-        self._space_held = False
+        self._win_held  = False
+        self._ctrl_held = False
 
         keyboard.hook(self._on_keyboard_event, suppress=False)
         # Sortörés billentyűk (ezek egyszerű kombinációk, add_hotkey elég)
@@ -798,14 +798,14 @@ class VoicetexApp(ctk.CTk):
         dn   = event.event_type == keyboard.KEY_DOWN
         up   = event.event_type == keyboard.KEY_UP
 
-        if name in ('alt', 'left alt', 'right alt'):
-            self._alt_held = dn
+        if name in ('windows', 'left windows', 'right windows'):
+            self._win_held = dn
             if up and self.recording:
                 self._stop_and_process()
 
-        elif name == 'space':
-            self._space_held = dn
-            if dn and self._alt_held:
+        elif name in ('ctrl', 'left ctrl', 'right ctrl'):
+            self._ctrl_held = dn
+            if dn and self._win_held:
                 self.start_recording()
             elif up and self.recording:
                 self._stop_and_process()
@@ -838,7 +838,7 @@ class VoicetexApp(ctk.CTk):
         """5 mp lejártakor: ha még nyomva tartja → folytatás; ha elengedte → leállás."""
         if not self.recording:
             return
-        if keyboard.is_pressed('alt') and keyboard.is_pressed('space'):
+        if keyboard.is_pressed('windows') and keyboard.is_pressed('ctrl'):
             # Még nyomja → új 5 másodperces kör
             self._schedule_auto_stop()
         else:
@@ -855,7 +855,7 @@ class VoicetexApp(ctk.CTk):
             with self._audio_lock:
                 self.audio_data = deque()
             self.status_label.configure(
-                text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / tartva: folytatja)",
+                text="Állapot: 🎙️ HALLGATÓZOM...  (Win+Ctrl tartva: folytatja)",
                 text_color="red"
             )
             self.after(0, lambda: self._show_indicator(True))
