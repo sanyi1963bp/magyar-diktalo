@@ -1,6 +1,7 @@
 import customtkinter as ctk
 import tkinter as tk
 import threading
+from collections import deque
 import keyboard
 import sounddevice as sd
 import numpy as np
@@ -16,6 +17,7 @@ import sys
 import json
 import ctypes
 import time
+import tempfile
 
 # --- Windows fókusz-kezelés ---
 _user32 = ctypes.windll.user32
@@ -137,27 +139,15 @@ def apply_voice_commands(text: str) -> str:
     for pattern, replacement in VOICE_COMMANDS:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-    # "nagybetű" → az előtte lévő szót nagybetűsíti, majd törli a parancsszót
-    def capitalize_prev(m):
-        before = m.string[:m.start()].rstrip()
-        after  = m.string[m.end():]
-        # Az utolsó szót nagybetűsítjük
-        words = before.rsplit(' ', 1)
-        if len(words) == 2:
-            return words[0] + ' ' + words[1].upper()
-        return before.upper()
-
-    # Először megkeressük a "nagybetű" szót és az előtte lévő szót együtt
+    # "[szó] nagybetű" → az előző szót nagybetűsíti
     text = re.sub(r'(\S+)\s+nagybetű', lambda m: m.group(1).upper(), text, flags=re.IGNORECASE)
 
-    # Felesleges szóközök tisztítása írásjelek előtt
+    # Szóközök tisztítása írásjelek körül
     text = re.sub(r'\s+([?!.,;:)])', r'\1', text)
     text = re.sub(r'([(])\s+', r'\1', text)
-    # Dupla szóközök eltávolítása
     text = re.sub(r'  +', ' ', text)
 
-    # Csak szóközöket és tabulátorokat vágunk le a szélekről,
-    # a sortöréseket (pl. "bekezdés" a szöveg elején/végén) megőrizzük!
+    # Szélső szóközök/tabok levágása, sortörések megőrzése
     return text.strip(' \t')
 
 # --- GPU / CPU DETEKTÁLÁS ---
@@ -304,15 +294,17 @@ class VoicetexApp(ctk.CTk):
         self.geometry("500x820")
 
         self.recording = False
-        self.audio_data = []
+        self._audio_lock = threading.Lock()
+        self.audio_data  = deque()          # Thread-safe hangpuffer
         self.fs = 16000
         self.whisper_model = None
-        self.selected_device_id = None  # None = rendszer alapértelmezett
-        self._auto_stop_timer = None    # 5 másodperces auto-stop timer
-        self.target_hwnd = None         # Célablak handle (ahová beillesztünk)
-        self._vu_level   = 0.0          # Aktuális hangszint 0.0–1.0
-        self._vu_peak    = 0.0          # Csúcsjelző (lassan csökken)
-        self._monitor_stream = None     # Folyamatos figyelő stream (nem felvétel)
+        self.selected_device_id = None      # None = rendszer alapértelmezett
+        self._auto_stop_timer = None        # 5 másodperces auto-stop timer
+        self.target_hwnd = None             # Célablak handle (ahová beillesztünk)
+        self._vu_level   = 0.0              # Aktuális hangszint 0.0–1.0
+        self._vu_peak    = 0.0              # Csúcsjelző (lassan csökken)
+        self._vu_bars    = []               # Canvas téglalap ID-k (előre létrehozva)
+        self._temp_wav   = os.path.join(tempfile.gettempdir(), "voicetex_temp.wav")
 
         # --- UI Felépítése ---
         self.label = ctk.CTkLabel(self, text="Voicetex AI", font=("Segoe UI", 24, "bold"))
@@ -483,7 +475,8 @@ class VoicetexApp(ctk.CTk):
         self._vu_canvas.bind("<ButtonPress-1>",   self._on_vu_press)
         self._vu_canvas.bind("<ButtonRelease-1>", self._on_vu_release)
 
-        # VU animáció indítása
+        # VU sávok előre létrehozása (egyszer, induláskor)
+        self._init_vu_bars()
         self._draw_vu_meter()
 
         threading.Thread(target=self.setup_hotkeys, daemon=True).start()
@@ -493,56 +486,56 @@ class VoicetexApp(ctk.CTk):
     #  VU METER                                                           #
     # ------------------------------------------------------------------ #
 
-    def _draw_vu_meter(self):
-        """VU meter kirajzolása és folyamatos frissítése (50ms-enként)."""
+    # VU METER KONSTANSOK
+    _VU_N   = 28
+    _VU_W   = 400
+    _VU_H   = 38
+    _VU_GAP = 3
+
+    def _init_vu_bars(self):
+        """Egyszer lefut induláskor: létrehozza a téglalapokat, elmenti az ID-ket."""
         c = self._vu_canvas
-        c.delete("all")
-
-        W, H = 400, 38
-        N = 28          # sávok száma
-        gap = 3
+        N, W, H, gap = self._VU_N, self._VU_W, self._VU_H, self._VU_GAP
         bar_w = (W - (N + 1) * gap) / N
-        level = self._vu_level          # 0.0–1.0
-        peak  = self._vu_peak           # csúcs
-
+        self._vu_bars = []
         for i in range(N):
             x1 = gap + i * (bar_w + gap)
             x2 = x1 + bar_w
-            frac = (i + 1) / N          # hány sáv van bekapcsolva ennél a szintnél
+            rid = c.create_rectangle(x1, 5, x2, H - 5, fill="#0a3320", outline="")
+            self._vu_bars.append(rid)
 
-            # Szín logika: zöld → sárga → piros
+    def _draw_vu_meter(self):
+        """VU meter frissítése 50ms-enként – csak a színeket változtatja."""
+        c     = self._vu_canvas
+        N     = self._VU_N
+        level = self._vu_level
+        peak  = self._vu_peak
+
+        for i, rid in enumerate(self._vu_bars):
+            frac = (i + 1) / N
             if frac <= 0.55:
-                on_color  = "#00e676"   # zöld
-                off_color = "#0a3320"
+                on_color, off_color = "#00e676", "#0a3320"
             elif frac <= 0.80:
-                on_color  = "#ffea00"   # sárga
-                off_color = "#2e2a00"
+                on_color, off_color = "#ffea00", "#2e2a00"
             else:
-                on_color  = "#ff1744"   # piros
-                off_color = "#2e0007"
+                on_color, off_color = "#ff1744", "#2e0007"
 
-            lit = frac <= level
-            color = on_color if lit else off_color
-
-            # Csúcsjelző: a csúcs sávot mindig kiemeljük
-            if abs(frac - peak) < 1 / N:
+            if frac <= level or abs(frac - peak) < 1 / N:
                 color = on_color
+            else:
+                color = off_color
+            c.itemconfig(rid, fill=color)
 
-            y1, y2 = 5, H - 5
-            c.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
-
-        # Felvétel közben: villogó szegély
+        # Felvétel közben piros szegély
         if self.recording:
             c.configure(highlightbackground="#ff1744", highlightthickness=2)
         else:
             c.configure(highlightbackground="#333355", highlightthickness=1)
 
-        # Csúcs lassú csökkenése
-        self._vu_peak = max(0.0, self._vu_peak - 0.015)
-        # Szint gyors csillapítása (ha nincs új adat)
+        # Szint és csúcs csillapítása
+        self._vu_peak  = max(0.0, self._vu_peak  - 0.015)
         self._vu_level = max(0.0, self._vu_level * 0.75)
 
-        # Következő frame 50ms múlva
         self.after(50, self._draw_vu_meter)
 
     def _on_vu_press(self, event):
@@ -593,9 +586,10 @@ class VoicetexApp(ctk.CTk):
         if level > self._vu_peak:
             self._vu_peak = level
 
-        # Felvétel esetén az adat is kerüljön a pufferbe
+        # Felvétel esetén az adat kerüljön a pufferbe (lock alatt)
         if self.recording:
-            self.audio_data.append(indata.copy())
+            with self._audio_lock:
+                self.audio_data.append(indata.copy())
 
     def on_device_change(self, selected):
         """Frissíti a kiválasztott eszköz ID-ját és infó feliratát."""
@@ -755,7 +749,8 @@ class VoicetexApp(ctk.CTk):
             if not self.target_hwnd:
                 self.target_hwnd = get_foreground_window()
             self.recording = True
-            self.audio_data = []
+            with self._audio_lock:
+                self.audio_data = deque()
             self.status_label.configure(
                 text="Állapot: 🎙️ HALLGATÓZOM...  (5mp / tartva: folytatja)",
                 text_color="red"
@@ -764,23 +759,20 @@ class VoicetexApp(ctk.CTk):
             self._schedule_auto_stop()
             # Az adat gyűjtését a _monitor_callback végzi (mindig fut)
 
-    def stop_recording_if_active(self, event):
-        """Megtartjuk kompatibilitás miatt, de most már a _on_key_release kezeli."""
-        pass
-
     def process_audio(self):
         self.status_label.configure(text="Állapot: AI gondolkodik...", text_color="cyan")
 
-        if not self.audio_data:
-            return
+        with self._audio_lock:
+            if not self.audio_data:
+                return
+            audio_np = np.concatenate(list(self.audio_data), axis=0)
 
-        audio_np = np.concatenate(self.audio_data, axis=0)
-        wavfile.write("temp.wav", self.fs, audio_np)
+        wavfile.write(self._temp_wav, self.fs, audio_np)
 
         def _ai_task():
             try:
                 segments, info = self.whisper_model.transcribe(
-                    "temp.wav",
+                    self._temp_wav,
                     beam_size=5,
                     language="hu",
                     vad_filter=True,
@@ -793,7 +785,7 @@ class VoicetexApp(ctk.CTk):
                     # Fallback: beam_size=1 és suppress_tokens nélkül
                     try:
                         segments, info = self.whisper_model.transcribe(
-                            "temp.wav",
+                            self._temp_wav,
                             beam_size=1,
                             language="hu",
                             vad_filter=False
